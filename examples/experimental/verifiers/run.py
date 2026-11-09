@@ -1,12 +1,10 @@
-"""Verifiers launcher (Qwen3-0.6B on code-golf-v1): Miles <-> Verifiers V1.
+"""Train Qwen3-0.6B using complete CodeGolf episodes on CPU env-server workers.
 
 Defaults reproduce the two-GPU smoke configuration: 3 GRPO steps against the
-`code-golf-v1` taskset. Scale --num-rollout and the batch sizes for real
-training, and point --verifiers-config at your own EnvConfig TOML.
+`code-golf` taskset. Point --verifiers-config at a distributed adapter TOML.
 
-The Verifiers environment must already be installed in this interpreter, e.g.
-`prime env install code-golf-v1` from a workspace with ./environments (see
-README.md).
+Install the matching renderers/verifiers forks and the code_golf package on
+the client and CPU workers. Runtime credentials belong on the workers.
 
 Usage:
     python run.py
@@ -14,6 +12,7 @@ Usage:
     python run.py --eval-interval 5      # evaluate the whole taskset every 5 rollouts
 """
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,9 +41,12 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     ref_load: str = "/root/models/Qwen3-0.6B_torch_dist"
     save_dir: str = "/root/Qwen3-0.6B_verifiers/"
 
-    # The Verifiers EnvConfig TOML. Written below when left at the default.
+    # Adapter config. A matching local server config is generated when absent.
     verifiers_config: str = "/root/verifiers-code-golf.toml"
-    taskset_id: str = "code-golf-v1"
+    taskset_id: str = "code-golf"
+    env_server_addresses: str = ""
+    """Comma-separated predeployed CPU server addresses; empty starts an owned pool."""
+    env_server_workers: int = 2
 
     # Training settings (smoke scale)
     rollout_max_response_len: int = 512
@@ -57,7 +59,7 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     # Evaluation over the whole taskset, every N training rollouts. 0 disables it.
     # Group rewards need at least two rollouts per task to rank.
     eval_interval: int = 0
-    n_samples_per_eval_prompt: int = 2
+    n_samples_per_eval_prompt: int = 4
 
 
 def prepare(args: ScriptArgs):
@@ -73,11 +75,33 @@ def prepare(args: ScriptArgs):
     )
 
 
+def _write_configs(args: ScriptArgs, config_path: Path) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    env = f"[env.taskset]\nid = {json.dumps(args.taskset_id)}\n"
+    remote = "[remote]\n"
+    if args.taskset_id == "code-golf":
+        if args.eval_interval and args.n_samples_per_eval_prompt % args.n_samples_per_prompt:
+            raise ValueError("CodeGolf eval sample count must be a multiple of the complete episode's attempts")
+        env = f"[env]\nattempts = {args.n_samples_per_prompt}\n" + env
+        env += '\n[env.golfer.harness]\nid = "null"\n'
+        remote += "episodes_per_prompt = 1\n"
+        remote += f"eval_episodes_per_prompt = {max(1, args.n_samples_per_eval_prompt // args.n_samples_per_prompt)}\n"
+    addresses = [value.strip() for value in args.env_server_addresses.split(",") if value.strip()]
+    if addresses:
+        remote += f"addresses = {json.dumps(addresses)}\n"
+    else:
+        server_path = config_path.with_name(config_path.stem + "-server.toml")
+        server_path.write_text(env + f'\n[serve.pool]\ntype = "static"\nnum_workers = {args.env_server_workers}\n')
+        remote += f"server_config = {json.dumps(str(server_path.resolve()))}\n"
+    client = '\n[client]\nbackend = "sglang"\n' f"renderer_model_name = {json.dumps(args.sglang_tokenizer_path)}\n"
+    config_path.write_text(env + "\n" + remote + client)
+
+
 def execute(args: ScriptArgs):
     U = args.create_backend()
     config_path = Path(args.verifiers_config)
     if not config_path.exists():
-        config_path.write_text(f'[taskset]\nid = "{args.taskset_id}"\n')
+        _write_configs(args, config_path)
 
     extra_env_vars = {
         "PYTHONPATH": f"{args.megatron_path}:{SCRIPT_DIR}:{command_utils.repo_base_dir}",

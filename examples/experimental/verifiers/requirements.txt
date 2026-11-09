@@ -1,5 +1,6 @@
-openai-agents<0.5
-# 0.1.11 removes the renderer pool APIs used by Miles and Verifiers 0.2.0.
-renderers==0.1.10
-# 0.2.1 requires OpenAI>=2.9, while SGLang pins OpenAI==2.6.1.
-verifiers>=0.2.0,<0.2.1
+code-golf @ git+https://github.com/KMSorSMS/verifiers.git@855b1806dfbb7bb21d2fbf22cc7903007eeac74a#subdirectory=environments/code_golf
+msgpack>=1.1
+pyzmq>=26.0
+# Matching native-SGLang implementations; the older PyPI adapter is incompatible.
+renderers[multimodal] @ git+https://github.com/KMSorSMS/renderers.git@e8e6be99bf3722ea7cf01e4ad5b71e0941328899
+verifiers @ git+https://github.com/KMSorSMS/verifiers.git@855b1806dfbb7bb21d2fbf22cc7903007eeac74a

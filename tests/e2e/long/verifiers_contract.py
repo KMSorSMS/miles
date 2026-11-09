@@ -27,8 +27,8 @@ def verify_sdk_contract(
                 "python",
                 "-m",
                 "pytest",
-                f"{test_file}::test_canonical_tokenizer_selects_tool_renderer_for_ambiguous_local_checkpoint",
-                f"{test_file}::test_verifiers_episode_owns_group_reward_computation",
+                f"{test_file}::test_wire_trace_preserves_training_arrays",
+                f"{test_file}::test_episode_finalizes_joint_rewards",
                 "-v",
                 f"--junitxml={report_path}",
             ]

@@ -1,0 +1,123 @@
+# Deployment procedure and matching client configuration: README.md.
+# Replace the image and environment plugin with the versions used by Miles.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: miles-verifiers-env
+  labels:
+    app.kubernetes.io/name: miles-verifiers-env
+data:
+  server.toml: |
+    run_id = "replace-with-training-run-id"
+    log_level = "INFO"
+
+    [env]
+    max_concurrent_agents = 8
+    attempts = 4
+
+    [env.taskset]
+    id = "code-golf"
+
+    [env.golfer.harness]
+    id = "null"
+
+    [serve]
+    address = "tcp://0.0.0.0:5555"
+    max_concurrent = 128
+    startup_timeout = 120
+    shutdown_timeout = 30
+
+    [serve.pool]
+    type = "static"
+    num_workers = 4
+
+    [serve.payload]
+    bind_host = "0.0.0.0"
+    # Advertised host comes from the pod IP command-line override below.
+    port = 0
+    max_bytes = 1073741824
+    ttl_seconds = 3600
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: miles-verifiers-env
+  labels:
+    app.kubernetes.io/name: miles-verifiers-env
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: miles-verifiers-env
+  ports:
+    - name: env-rpc
+      port: 5555
+      targetPort: env-rpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: miles-verifiers-env
+  labels:
+    app.kubernetes.io/name: miles-verifiers-env
+spec:
+  serviceName: miles-verifiers-env
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: miles-verifiers-env
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: miles-verifiers-env
+    spec:
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: env-server
+          # CPU image containing these matching Miles/verifiers/renderers forks
+          # and the selected taskset/harness plugins; no prime_rl installation.
+          image: YOUR_REGISTRY/miles-env-server:integration
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "miles.env_server"]
+          args:
+            - --config
+            - /etc/miles-env/server.toml
+            - --address
+            - tcp://0.0.0.0:5555
+            - --payload-advertised-host
+            - $(POD_IP)
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: env-rpc
+              containerPort: 5555
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          startupProbe:
+            exec:
+              command: ["python", "-m", "miles.env_server", "--health-check", "tcp://127.0.0.1:5555"]
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["python", "-m", "miles.env_server", "--health-check", "tcp://127.0.0.1:5555"]
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+          volumeMounts:
+            - name: configuration
+              mountPath: /etc/miles-env
+              readOnly: true
+      volumes:
+        - name: configuration
+          configMap:
+            name: miles-verifiers-env

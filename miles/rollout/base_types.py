@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from miles.rollout.data_source import DataSource
 from miles.utils.types import Sample
 
 if TYPE_CHECKING:
+    from miles.rollout.data_source import DataSource
     from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
 
 

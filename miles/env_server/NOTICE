@@ -1,0 +1,7 @@
+The env-server protocol, incremental trace deltas, and worker-pool design are adapted
+from PrimeIntellect-ai/prime-rl at c82ef259418aa9d21159380b2b811cbca023befa,
+src/prime_rl/env and src/prime_rl/transports/payload.py.
+Original licensing is preserved in LICENSE.prime-rl.
+Miles modifications provide standalone configuration, lifecycle handling, explicit
+readiness and worker failure handling, replica routing and node payload transport.
+No PrimeRL training runtime is imported.

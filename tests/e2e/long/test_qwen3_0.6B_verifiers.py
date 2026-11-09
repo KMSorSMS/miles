@@ -1,5 +1,6 @@
 import math
 import os
+import shlex
 import shutil
 import site
 import sys
@@ -24,13 +25,13 @@ NUM_GPUS = 2
 MODEL_DIR = Path(os.environ.get("MILES_E2E_MODEL_DIR", "/root/models"))
 MEGATRON_PATH = Path(os.environ.get("MILES_E2E_MEGATRON_PATH", "/root/Megatron-LM"))
 RUN_DIR = Path(os.environ.get("MILES_E2E_RUN_DIR", "/tmp/miles-verifiers-e2e"))
-VERIFIERS_DIR = Path("/tmp/verifiers-v0.2.0")
+VERIFIERS_DIR = Path(os.environ.get("MILES_E2E_VERIFIERS_DIR", str(RUN_DIR / "verifiers-source")))
 ADAPTER_DIR = Path(command_utils.repo_base_dir) / "examples" / "experimental" / "verifiers"
 VERIFIERS_VENV = RUN_DIR / "verifiers-venv"
 VERIFIERS_SITE_PACKAGES = (
     VERIFIERS_VENV / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
 )
-CODE_GOLF_DIR = RUN_DIR / "environments" / "code_golf_v1"
+CODE_GOLF_DIR = RUN_DIR / "environments" / "code_golf"
 
 
 def prepare():
@@ -47,8 +48,38 @@ def prepare():
         pth_lines += [f"import site; site.addsitedir({path!r})" for path in launcher_site]
     (VERIFIERS_SITE_PACKAGES / "launcher-site.pth").write_text("\n".join(pth_lines) + "\n")
     U.exec_command_cpu(
+        # These forks have no release tags; scope version overrides to their builds.
+        "env SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RENDERERS=0.2.1.dev0 "
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VERIFIERS=0.4.2.dev0 "
         f"{VERIFIERS_VENV}/bin/python -m pip install "
         f"-r {command_utils.repo_base_dir}/examples/experimental/verifiers/requirements.txt"
+    )
+    if not VERIFIERS_DIR.exists():
+        U.exec_command_cpu(
+            shlex.join(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    "codex/distributed-verifiers-sglang",
+                    "https://github.com/KMSorSMS/verifiers.git",
+                    str(VERIFIERS_DIR),
+                ]
+            )
+        )
+        # Match the source pinned by the example's requirements, including its
+        # taskset package; do not let a later branch update change this recipe.
+        requirements = (ADAPTER_DIR / "requirements.txt").read_text()
+        revision = next(
+            line.rsplit("@", 1)[1] for line in requirements.splitlines() if line.startswith("verifiers @ git+")
+        )
+        U.exec_command_cpu(shlex.join(["git", "-C", str(VERIFIERS_DIR), "fetch", "--depth", "1", "origin", revision]))
+        U.exec_command_cpu(shlex.join(["git", "-C", str(VERIFIERS_DIR), "checkout", "--detach", "FETCH_HEAD"]))
+    shutil.copytree(VERIFIERS_DIR / "environments" / "code_golf", CODE_GOLF_DIR, dirs_exist_ok=True)
+    U.exec_command_cpu(
+        shlex.join([str(VERIFIERS_VENV / "bin/python"), "-m", "pip", "install", "--no-deps", str(CODE_GOLF_DIR)])
     )
     verify_sdk_contract(
         execute=U.exec_command_cpu,
@@ -57,20 +88,6 @@ def prepare():
         report_path=RUN_DIR / "sdk-contract.xml",
         pythonpath=f"{VERIFIERS_SITE_PACKAGES}:{command_utils.repo_base_dir}:{MEGATRON_PATH}:{os.environ.get('PYTHONPATH', '')}",
     )
-    # prime pins no upper bound on prime-sandboxes, and 0.3.0 dropped the
-    # CommandRequest the pinned prime imports, so the tool env has to cap it.
-    U.exec_command_cpu("uv tool install 'prime==0.6.19' --with 'prime-sandboxes<0.3'")
-    if not VERIFIERS_DIR.exists():
-        U.exec_command_cpu(
-            f"git clone --depth 1 --branch v0.2.0 "
-            f"https://github.com/PrimeIntellect-ai/verifiers.git {VERIFIERS_DIR}"
-        )
-    shutil.copytree(
-        VERIFIERS_DIR / "environments" / "code_golf_v1",
-        CODE_GOLF_DIR,
-        dirs_exist_ok=True,
-    )
-    U.exec_command_cpu(f'cd {RUN_DIR} && "$(uv tool dir --bin)/prime" --plain env install code-golf-v1')
     U.convert_checkpoint(
         model_name=MODEL_NAME,
         megatron_model_type=MODEL_TYPE,
@@ -84,7 +101,7 @@ def prepare():
 def execute():
     U = command_utils.default_config().create_backend()
     config_path = RUN_DIR / "code-golf.toml"
-    config_path.write_text('[taskset]\nid = "code-golf-v1"\n\n[timeout]\nrollout = 300\n')
+    _write_remote_configs(config_path)
     dump_dir = RUN_DIR / "dump"
 
     train_args = " ".join(
@@ -136,7 +153,6 @@ def execute():
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
-            "MILES_USE_LEGACY_ROLLOUT_V1": "1",
             "VF_LOG_LEVEL": "INFO",
             "PYTHONPATH": (
                 f"{VERIFIERS_SITE_PACKAGES}:{CODE_GOLF_DIR}:{MEGATRON_PATH}:{ADAPTER_DIR}:{command_utils.repo_base_dir}"
@@ -146,6 +162,23 @@ def execute():
         megatron_path=str(MEGATRON_PATH),
     )
     verify(dump_dir)
+
+
+def _write_remote_configs(config_path: Path):
+    # The env owns the four jointly scored attempts; one RPC returns the entire
+    # episode. Both client and workers validate the same environment definition.
+    env = (
+        "[env]\nattempts = 4\nmax_concurrent_agents = 4\n"
+        '\n[env.taskset]\nid = "code-golf"\n'
+        '\n[env.golfer.harness]\nid = "null"\n'
+        # Trusted test-only programs run inside the isolated GPU test container.
+        '\n[env.golfer.runtime]\ntype = "subprocess"\n'
+        "\n[env.golfer.timeout]\nrollout = 300\n"
+    )
+    config_path.write_text(
+        env + '\n[remote]\nserver_config = "server.toml"\nepisodes_per_prompt = 1\neval_episodes_per_prompt = 1\n'
+    )
+    (config_path.parent / "server.toml").write_text(env + '\n[serve.pool]\ntype = "static"\nnum_workers = 2\n')
 
 
 def verify(dump_dir: Path):
@@ -171,7 +204,12 @@ def verify(dump_dir: Path):
     assert any(sample["metadata"]["verifiers"]["metrics"]["passed"] for sample in samples)
     for group_index in range(3):
         group = [sample for sample in samples if sample["group_index"] == group_index]
-        assert sum(sample["metadata"]["verifiers"]["rewards"]["fastest"] for sample in group) == pytest.approx(0.5)
+        passing = [sample for sample in group if sample["metadata"]["verifiers"]["metrics"]["passed"]]
+        fastest = min((sample["metadata"]["verifiers"]["metrics"]["latency"] for sample in passing), default=None)
+        for sample in group:
+            metadata = sample["metadata"]["verifiers"]
+            expected = 0.5 if metadata["metrics"]["passed"] and metadata["metrics"]["latency"] == fastest else 0.0
+            assert metadata["rewards"]["fastest"] == pytest.approx(expected)
 
 
 if __name__ == "__main__":

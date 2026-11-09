@@ -1,857 +1,262 @@
-import asyncio
-import sys
-from argparse import Namespace
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
-from typing import Any
+"""Remote adapter invariants: exact training evidence and complete episode scoring."""
 
+from argparse import Namespace
+
+import numpy as np
 import pytest
 
-if sys.version_info < (3, 11):
-    pytest.skip("Verifiers requires Python 3.11+", allow_module_level=True)
+vf = pytest.importorskip("verifiers.v1")
+if not hasattr(vf, "TrainClientConfig") or "backend" not in vf.TrainClientConfig.model_fields:
+    pytest.skip("Requires the native-SGLang Verifiers SDK", allow_module_level=True)
 
-import examples.experimental.verifiers.verifiers_rollout as verifiers_rollout
 from examples.experimental.verifiers.verifiers_rollout import (
-    MilesSGLangTransport,
     VerifiersRolloutFn,
     _config_path,
-    _finish_reason,
-    _import_verifiers,
     _load_config_data,
-    _make_eval_args,
-    _raise_for_unsupported_trace_errors,
-    _renderer_identity,
+    _raise_for_fatal_episode_errors,
     _trace_eval_reward,
-    _train_client,
     _validate_args,
-    _validate_group_reward_sample_counts,
-    trace_to_sample,
-    trace_to_samples,
 )
-from tests.fast.fixtures.args_fixtures import sglang_router_args
-from tests.fast.train_parallel_config_utils import make_train_parallel_config
+from examples.experimental.verifiers.verifiers_samples import trace_to_samples
+from verifiers.v1.graph import MessageNode
+from verifiers.v1.trace import Error
+from verifiers.v1.types import SamplingMask, TopLogprobs, WeightVersionSpan
 
-from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from miles.rollout.base_types import BaseRolloutFn, RolloutFnConstructorInput
-from miles.utils.args.custom_view import ImmutableNamespace
 from miles.utils.types import Sample
 
 
-def _args(**overrides) -> Namespace:
-    values = {
-        "lora_adapter_path": None,
-        "lora_rank": 0,
-        "reward_key": None,
-        "length_penalty_coeff": 0.0,
-        "length_penalty_min_tokens": 1,
-        "num_rollout": None,
-        "router": "sglang",
-        "rollout_max_context_len": 64,
-        "rollout_max_prompt_len": None,
-        "rollout_max_response_len": 8,
-        "rollout_skip_special_tokens": True,
-        "rollout_stop": None,
-        "rollout_stop_token_ids": None,
-        "sglang_model_routers": None,
-        "sglang_router_ip": "127.0.0.1",
-        **sglang_router_args("round_robin"),
-        "sglang_router_port": 30000,
-        "sglang": SglangConfig(models=[], base_args={"tokenizer_path": None, "enable_deterministic_inference": False}),
-    }
-    values.update(overrides)
-    return Namespace(**values)
-
-
-def _branch(*, index=0, token_ids=None, sampled_mask=None, logprobs=None):
-    return SimpleNamespace(
-        index=index,
-        token_ids=[10, 11, 20, 21, 22] if token_ids is None else token_ids,
-        sampled_mask=[False, False, True, False, True] if sampled_mask is None else sampled_mask,
-        logprobs=[0.0, 0.0, -0.1, 0.0, -0.2] if logprobs is None else logprobs,
+def sample_args(**overrides):
+    return Namespace(
+        **(
+            dict(
+                reward_key=None,
+                use_sampling_support_replay=False,
+                rollout_top_logprobs_num=0,
+                use_rollout_routing_replay=False,
+                use_rollout_indexer_replay=False,
+            )
+            | overrides
+        )
     )
 
 
-def _trace(**overrides):
-    values = {
-        "id": "trace-1",
-        "branches": [_branch()],
-        "task": SimpleNamespace(data=SimpleNamespace(prompt="solve this", idx="task-1")),
-        "rewards": {"score": 1.25, "bonus": 0.75},
-        "metrics": {"turns": 2.0},
-        "stop_condition": "done",
-        "error": None,
-        "has_error": False,
-        "is_truncated": False,
-        "reward": 2.0,
-        "last_reply": "answer",
-        "num_turns": 2,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _wiring_args(**overrides) -> Namespace:
-    values = {
-        "rollout_global_dataset": False,
-        "partial_rollout": False,
-        "multimodal_keys": None,
-        "chat_template_path": None,
-        "use_opd": False,
-        "use_rollout_routing_replay": False,
-        "use_rollout_indexer_replay": False,
-    }
-    values.update(overrides)
-    return Namespace(**values)
-
-
-def test_supported_wiring_passes_validation():
-    _validate_args(_wiring_args())
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"rollout_global_dataset": True}, "--disable-rollout-global-dataset"),
-        ({"partial_rollout": True}, "cannot be resumed"),
-        ({"multimodal_keys": {"image": "image"}}, "text-only renderer inputs"),
-        ({"chat_template_path": "/tmp/custom.jinja"}, "custom\n?\s*Jinja template"),
-        ({"use_opd": True}, "--use-opd"),
-        ({"use_rollout_routing_replay": True}, "--use-rollout-routing-replay"),
-        ({"use_rollout_indexer_replay": True}, "--use-rollout-indexer-replay"),
-    ],
-)
-def test_unsupported_wiring_fails_before_any_episode_runs(overrides, message):
-    with pytest.raises(ValueError, match=message):
-        _validate_args(_wiring_args(**overrides))
-
-
-def test_config_path_comes_from_the_environment(monkeypatch):
-    monkeypatch.setenv("VERIFIERS_CONFIG", "/tmp/vf.toml")
-
-    assert _config_path() == "/tmp/vf.toml"
-
-
-def test_missing_config_env_var_names_the_variable(monkeypatch):
-    monkeypatch.delenv("VERIFIERS_CONFIG", raising=False)
-
-    with pytest.raises(ValueError, match="VERIFIERS_CONFIG"):
-        _config_path()
-
-
-def test_config_loader_uses_verifiers_toml_format(tmp_path):
-    path = tmp_path / "verifiers.toml"
-    path.write_text('[taskset]\nid = "gsm8k-v1"\n')
-
-    assert _load_config_data(path) == {"taskset": {"id": "gsm8k-v1"}}
-
-
-def test_config_loader_rejects_non_toml_formats(tmp_path):
-    path = tmp_path / "verifiers.yaml"
-    path.write_text("taskset: gsm8k-v1\n")
-
-    with pytest.raises(ValueError, match="Verifiers TOML"):
-        _load_config_data(path)
-
-
-def test_verifiers_0_2_1_is_rejected_with_compatibility_reason(monkeypatch):
-    monkeypatch.setattr(
-        "examples.experimental.verifiers.verifiers_rollout._installed_version",
-        lambda package: {"verifiers": "0.2.1"}[package],
+def make_trace(*, branches=False, arrays=False):
+    prefix = MessageNode(message=vf.UserMessage(content="question"), token_ids=[10], mask=[False])
+    answer = MessageNode(
+        parent=0,
+        message=vf.AssistantMessage(content="A"),
+        sampled=True,
+        token_ids=[20, 21],
+        mask=[False, True],
+        logprobs=[-0.125],
     )
-
-    with pytest.raises(RuntimeError, match="SGLang 0.5.15 pins OpenAI"):
-        _import_verifiers()
-
-
-def test_renderers_0_1_11_is_rejected_with_compatibility_reason(monkeypatch):
-    versions = {"verifiers": "0.2.0", "renderers": "0.1.11"}
-    monkeypatch.setattr(
-        "examples.experimental.verifiers.verifiers_rollout._installed_version",
-        versions.__getitem__,
+    trace = vf.Trace(
+        task=vf.TraceTask(type="Task", data=vf.TaskData(idx=3, prompt="question")),
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        nodes=[prefix, answer],
+        ok=True,
+        is_completed=True,
     )
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"renderers>=0\.1\.8,<0\.1\.11.*removes the renderer pool APIs",
-    ):
-        _import_verifiers()
-
-
-def test_transport_does_not_treat_aborted_generation_as_complete():
-    with pytest.raises(RuntimeError, match="aborted"):
-        _finish_reason({"meta_info": {"finish_reason": {"type": "abort"}}})
-
-
-@pytest.mark.parametrize(
-    ("checkpoint", "expected"),
-    [
-        ("/models/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-4B-Instruct-2507"),
-        (
-            "/cache/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/revision",
-            "Qwen/Qwen3-4B-Instruct-2507",
-        ),
-        ("/models/private-finetune", None),
-    ],
-)
-def test_renderer_identity_is_inferred_from_standard_checkpoint_paths(checkpoint, expected):
-    pytest.importorskip("renderers", minversion="0.1.8")
-
-    assert _renderer_identity(checkpoint) == expected
-
-
-def test_train_client_uses_local_tokenizer_with_inferred_renderer_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local tokenizer files retain the checkpoint's registered renderer identity."""
-    renderers = pytest.importorskip("renderers", minversion="0.1.8")
-    checkpoint = "/cache/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/revision"
-    seen = {}
-
-    class BaseTrainClient:
-        def __init__(self, openai, pool_size, config=None, renderer_model_name=None):
-            self.openai = openai
-            self.pool_size = pool_size
-            self.config = config
-            self.renderer_model_name = renderer_model_name
-            self._pool = None
-
-    class RendererPool:
-        def __init__(self, factory, size):
-            seen["size"] = size
-            seen["renderer"] = factory()
-
-    def load_tokenizer(source):
-        seen["source"] = source
-        return SimpleNamespace(name_or_path=source)
-
-    def create_renderer(tokenizer, config, *, chat_template_kwargs=None):
-        seen["identity"] = tokenizer.name_or_path
-        seen["config"] = config
-        seen["kwargs"] = chat_template_kwargs
-        return "renderer"
-
-    monkeypatch.setattr(renderers, "RendererPool", RendererPool)
-    monkeypatch.setattr(renderers, "create_renderer", create_renderer)
-    monkeypatch.setattr("renderers.base.load_tokenizer", load_tokenizer)
-    runtime = SimpleNamespace(TrainClient=BaseTrainClient)
-
-    args = _args(sglang=SglangConfig(models=[], base_args={"tokenizer_path": "/models/custom-tokenizer"}))
-    client = _train_client(runtime, args, checkpoint, pool_size=3)
-    pool = client._renderer_pool(checkpoint, chat_template_kwargs={"enable_thinking": False})
-
-    assert isinstance(pool, RendererPool)
-    assert seen == {
-        "size": 3,
-        "source": "/models/custom-tokenizer",
-        "identity": "Qwen/Qwen3-4B-Instruct-2507",
-        "config": None,
-        "kwargs": {"enable_thinking": False},
-        "renderer": "renderer",
-    }
+    trace.record_reward("score", 2, 0.5)
+    if branches:
+        trace.nodes.extend(
+            [
+                MessageNode(
+                    parent=1,
+                    message=vf.AssistantMessage(content="B"),
+                    sampled=True,
+                    token_ids=[22],
+                    mask=[True],
+                    logprobs=[-0.25],
+                ),
+                MessageNode(
+                    parent=1,
+                    message=vf.AssistantMessage(content="C"),
+                    sampled=True,
+                    token_ids=[23],
+                    mask=[True],
+                    logprobs=[-0.5],
+                ),
+            ]
+        )
+    if arrays:
+        for node in trace.nodes:
+            size = len(node.token_ids)
+            node.routed_experts = np.arange(size * 2, dtype=np.uint16).reshape(size, 1, 2) + 300
+            node.indexer_topk = np.arange(size * 2, dtype=np.int32).reshape(size, 1, 2) + 1000
+        answer.sampling_mask = SamplingMask(ids=np.array([21, 7], np.int32), counts=np.array([2], np.int32))
+        answer.top_logprobs = TopLogprobs(
+            ids=np.array([21, 7], np.int32),
+            counts=np.array([2], np.int32),
+            logprobs=np.array([-0.125, -2], np.float32),
+        )
+    return trace
 
 
-def test_canonical_tokenizer_selects_tool_renderer_for_ambiguous_local_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Structured tokenizer identity disambiguates local Qwen checkpoints for tools."""
-    renderers = pytest.importorskip("renderers", minversion="0.1.8")
-    runtime = pytest.importorskip("verifiers.v1.clients.train")
-    checkpoint = "/root/models/Qwen3-0.6B"
-    loaded_sources: list[str] = []
-
-    def load_tokenizer(source: str) -> SimpleNamespace:
-        loaded_sources.append(source)
-        return SimpleNamespace(name_or_path=source, convert_tokens_to_ids=lambda token: 1, unk_token_id=0)
-
-    monkeypatch.setattr("renderers.base.load_tokenizer", load_tokenizer)
-    args = ImmutableNamespace.model_validate(
-        vars(_args(sglang=SglangConfig(models=[], base_args={"tokenizer_path": "Qwen/Qwen3-0.6B"})))
+def test_wire_trace_preserves_training_arrays():
+    trace = make_trace(arrays=True)
+    episode = vf.Episode(task=trace.task, traces=[trace], ok=True)
+    wire = vf.WireEpisode.model_validate(episode.model_dump())
+    args = sample_args(
+        use_sampling_support_replay=True,
+        rollout_top_logprobs_num=2,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=True,
+        reward_key="score",
     )
-    assert _renderer_identity(checkpoint) is None
-
-    client = _train_client(runtime, args, checkpoint, pool_size=1)
-    pool = client._renderer_pool(checkpoint)
-
-    assert isinstance(pool, renderers.RendererPool)
-    assert pool.supports_tools is True
-    assert loaded_sources == ["Qwen/Qwen3-0.6B"]
-
-
-@pytest.mark.asyncio
-async def test_train_client_reports_unsupported_tool_renderer_as_configuration_error():
-    pytest.importorskip("renderers", minversion="0.1.8")
-
-    class ProviderError(Exception):
-        def __init__(self, message, *, status_code):
-            super().__init__(message)
-            self.status_code = status_code
-
-    class BaseTrainClient:
-        def __init__(self, openai, pool_size, config=None, renderer_model_name=None):
-            pass
-
-        async def get_response(self, *args, **kwargs):
-            raise ValueError("RendererPool does not support tools.")
-
-    runtime = SimpleNamespace(ProviderError=ProviderError, TrainClient=BaseTrainClient)
-    client = _train_client(runtime, _args(), "/models/private-finetune", pool_size=1)
-
-    with pytest.raises(ProviderError, match="--sglang-tokenizer-path") as error:
-        await client.get_response()
-
-    assert error.value.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_train_client_reports_unsupported_dialect_as_configuration_error():
-    pytest.importorskip("renderers", minversion="0.1.8")
-
-    class ProviderError(Exception):
-        def __init__(self, message, *, status_code):
-            super().__init__(message)
-            self.status_code = status_code
-
-    class BaseTrainClient:
-        def __init__(self, openai, pool_size, config=None, renderer_model_name=None):
-            pass
-
-        async def get_response(self, *args, **kwargs):
-            raise NotImplementedError("only the chat-completions dialect is supported")
-
-    runtime = SimpleNamespace(ProviderError=ProviderError, TrainClient=BaseTrainClient)
-    client = _train_client(runtime, _args(), "/models/test", pool_size=1)
-
-    with pytest.raises(ProviderError, match="does not support this request") as error:
-        await client.get_response()
-
-    assert error.value.status_code == 400
-
-
-@pytest.mark.parametrize(("method", "message"), [("relay", "streaming"), ("relay_aux", "auxiliary")])
-@pytest.mark.asyncio
-async def test_train_client_reports_unsupported_relay_paths_as_configuration_errors(method, message):
-    pytest.importorskip("renderers", minversion="0.1.8")
-
-    class ProviderError(Exception):
-        def __init__(self, text, *, status_code):
-            super().__init__(text)
-            self.status_code = status_code
-
-    class BaseTrainClient:
-        def __init__(self, openai, pool_size, config=None, renderer_model_name=None):
-            pass
-
-    runtime = SimpleNamespace(ProviderError=ProviderError, TrainClient=BaseTrainClient)
-    client = _train_client(runtime, _args(), "/models/test", pool_size=1)
-
-    with pytest.raises(ProviderError, match=message) as error:
-        await getattr(client, method)()
-
-    assert error.value.status_code == 400
-
-
-def test_trace_to_sample_preserves_training_fields_and_verifiers_reward():
-    sample = trace_to_sample(_args(), _trace(), group_index=3, index=9)
-
-    assert sample.group_index == 3
-    assert sample.index == 9
-    assert sample.prompt == "solve this"
-    assert sample.tokens == [10, 11, 20, 21, 22]
-    assert sample.response == "answer"
-    assert sample.response_length == 3
-    assert sample.loss_mask == [1, 0, 1]
-    assert sample.rollout_log_probs == [-0.1, 0.0, -0.2]
-    assert sample.reward == 2.0
-    assert sample.routing_key == "trace-1"
-    assert sample.status == Sample.Status.COMPLETED
-    assert sample.metadata["verifiers"]["task_index"] == "task-1"
+    sample = trace_to_samples(args, wire.traces[0], group_index=4, index_start=9)[0]
+    assert sample.tokens == [10, 20, 21]
+    assert sample.rollout_log_probs == [-0.125]
+    assert sample.loss_mask == [1] and sample.reward == {"score": 1.0, "reward": 1.0}
+    assert sample.rollout_routed_experts.tolist() == [[[300, 301]], [[300, 301]]]
+    assert sample.rollout_indexer_topk.dtype == np.int32
+    assert len(sample.rollout_indexer_topk) == len(sample.tokens) - 1
+    assert sample.rollout_topk_token_ids.tolist() == [[21, 7]]
+    assert len(sample.rollout_sampling_mask) == 1
     sample.validate()
 
 
-def test_trace_to_sample_preserves_named_rewards_when_reward_key_is_set():
-    args = _args(reward_key="score")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed", [True, False])
+async def test_episode_finalizes_joint_rewards(passed):
+    # The real CodeGolf finalizer compares siblings in ONE complete episode.
+    from code_golf.taskset import CodeGolfEnv, CodeGolfEnvConfig
 
-    sample = trace_to_sample(args, _trace(), group_index=0, index=0)
+    traces = [make_trace(), make_trace()]
+    traces[0].nodes[-1].message.content = "print(1)"
+    traces[1].nodes[-1].message.content = "print(1 + 0)"
+    for i, trace in enumerate(traces):
+        trace.metrics.update(passed=float(passed), latency=float(i + 1))
+    episode = vf.Episode(task=traces[0].task, traces=traces, ok=True)
+    env = object.__new__(CodeGolfEnv)
+    env.config = CodeGolfEnvConfig(taskset={"id": "code-golf"}, attempts=2)
+    await env.finalize(None, episode)
+    restored = vf.WireEpisode.model_validate(episode.model_dump())
+    assert [trace.reward for trace in restored.traces] == ([2, 1] if passed else [1, 1])
+    # The adapter keeps the jointly finalized reward instead of recomputing it.
+    assert [
+        trace_to_samples(sample_args(), t, group_index=0, index_start=i)[0].reward
+        for i, t in enumerate(restored.traces)
+    ] == [t.reward for t in restored.traces]
 
-    assert sample.reward == {"score": 1.25, "bonus": 0.75, "reward": 2.0}
-    assert sample.get_reward_value(args) == 1.25
+
+def test_shared_prefix_trains_once_and_siblings_share_rollout_identity():
+    samples = trace_to_samples(sample_args(), make_trace(branches=True), group_index=2, index_start=10, rollout_id=7)
+    assert len(samples) == 2
+    assert samples[0].tokens == [10, 20, 21, 22]
+    assert samples[1].tokens == [10, 20, 21, 23]
+    assert samples[0].loss_mask == [1, 1] and samples[1].loss_mask == [1]
+    assert samples[1].response_length == 1
+    assert [s.rollout_id for s in samples] == [7, 7]
+    assert [s.lineage.output_index for s in samples] == [0, 1]
+    assert all(s.lineage.output_count == 2 for s in samples)
 
 
-def test_trace_to_sample_serializes_structured_prompt_messages():
-    class Message:
-        def model_dump(self, **kwargs):
-            assert kwargs == {"mode": "json", "exclude_none": True}
-            return {"role": "user", "content": "solve this"}
+def test_per_call_prefill_versions_survive_wire_and_sample_conversion():
+    trace = make_trace(branches=True)
+    node = trace.nodes[1]
+    node.weight_versions = [WeightVersionSpan(version="v2", start=0, end=1)]
+    node.prefill_weight_versions = [WeightVersionSpan(version="v1", start=0, end=2)]
+    node.prompt_tokens = 2
+    episode = vf.WireEpisode.model_validate(vf.Episode(task=trace.task, traces=[trace]).model_dump())
+    samples = trace_to_samples(sample_args(), episode.traces[0], group_index=0, index_start=0)
+    for sample in samples:
+        call = sample.weight_versions[0]
+        assert call.output_start == 2 and call.prompt_tokens == 2
+        assert [(s.version, s.abs_start, s.abs_end) for s in call.spans] == [("v2", 2, 3)]
+        assert [(s.version, s.abs_start, s.abs_end) for s in call.prefill_spans] == [("v1", 0, 2)]
 
-    trace = _trace(task=SimpleNamespace(data=SimpleNamespace(prompt=[Message()], idx="task-1")))
 
-    sample = trace_to_sample(_args(), trace, group_index=0, index=0)
-
-    assert sample.prompt == [{"role": "user", "content": "solve this"}]
-
-
-def test_trace_to_sample_marks_error_before_truncation():
-    error = SimpleNamespace(model_dump=lambda **_kwargs: {"type": "ProviderError"})
-
-    sample = trace_to_sample(
-        _args(),
-        _trace(error=error, has_error=True, is_truncated=True),
-        group_index=0,
-        index=0,
+def test_adapter_rejects_image_trace_without_token_attribution():
+    trace = make_trace()
+    trace.nodes[0].message = vf.UserMessage(
+        content=[{"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}]
     )
-
-    assert sample.status == Sample.Status.FAILED
-    assert sample.metadata["verifiers"]["error"] == {"type": "ProviderError"}
-
-
-def test_failed_eval_trace_with_missing_named_reward_returns_none():
-    trace = _trace(has_error=True, rewards={})
-
-    assert _trace_eval_reward(trace, "score") is None
-
-
-def test_successful_eval_trace_requires_configured_named_reward():
-    with pytest.raises(KeyError, match="score"):
-        _trace_eval_reward(_trace(rewards={}), "score")
-
-
-def test_unsupported_trace_error_is_not_resampled_forever():
-    error = SimpleNamespace(message="Miles' Verifiers adapter does not support this request: ResponsesDialect")
-
-    with pytest.raises(RuntimeError, match="ResponsesDialect"):
-        _raise_for_unsupported_trace_errors([_trace(error=error, has_error=True)])
-
-
-def test_graph_branches_fail_before_miles_can_corrupt_trace_groups():
-    trace = _trace(branches=[_branch(index=0), _branch(index=1)])
-
-    with pytest.raises(NotImplementedError, match="multiple graph branches"):
-        trace_to_samples(_args(), trace, group_index=4, index_start=10)
-
-
-def test_convert_group_uses_standard_miles_group_shape():
-    from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
-
     adapter = object.__new__(VerifiersRolloutFn)
-    adapter.args = _args()
-    adapter._next_sample_index = 0
+    adapter.args = sample_args()
+    adapter._next_sample_index = adapter._next_rollout_index = 0
+    adapter._processor = None
+    with pytest.raises(ValueError, match="multimodal token attribution"):
+        adapter._convert_group([vf.Episode(task=trace.task, traces=[trace])], group_index=0)
 
-    group = adapter._convert_group(
-        [_trace(id="first"), _trace(id="second")],
-        group_index=2,
+
+def test_bad_logprobs_and_missing_replay_cannot_silently_train():
+    trace = make_trace()
+    trace.nodes[-1].logprobs = np.array([], np.float32)
+    with pytest.raises(ValueError, match="missing sampled-token"):
+        trace_to_samples(sample_args(), trace, group_index=0, index_start=0)
+    with pytest.raises(ValueError, match="incomplete"):
+        trace_to_samples(sample_args(use_rollout_routing_replay=True), make_trace(), group_index=0, index_start=0)
+
+
+def test_nontrainable_or_dropped_trace_is_not_a_training_sample():
+    trace = make_trace()
+    trace.agent.trainable = False
+    assert trace_to_samples(sample_args(), trace, group_index=0, index_start=0) == []
+    trace.agent.trainable, trace.dropped = True, "excluded"
+    assert trace_to_samples(sample_args(), trace, group_index=0, index_start=0) == []
+
+
+def test_failed_trace_and_named_rewards():
+    trace = make_trace()
+    trace.ok = False
+    sample = trace_to_samples(sample_args(), trace, group_index=0, index_start=0)[0]
+    assert sample.status is Sample.Status.FAILED
+    assert _trace_eval_reward(trace, "missing") is None
+    trace.ok = True
+    with pytest.raises(KeyError):
+        _trace_eval_reward(trace, "missing")
+
+
+def test_recovered_retry_history_does_not_invalidate_success():
+    trace = make_trace()
+    trace.errors = [Error(type="ProviderError", message="previous attempt", status_code=400)]
+    episode = vf.Episode(task=trace.task, traces=[trace], ok=True, errors=list(trace.errors))
+    _raise_for_fatal_episode_errors([episode])
+    episode.ok = False
+    with pytest.raises(RuntimeError, match="protocol error"):
+        _raise_for_fatal_episode_errors([episode])
+    episode.errors = [Error(type="ProviderError", message="timeout", status_code=408)]
+    _raise_for_fatal_episode_errors([episode])
+    episode.ok = True
+    episode.errors = [Error(type="InferenceCleanupError", message="engine still running", status_code=503)]
+    with pytest.raises(RuntimeError, match="engine still running"):
+        _raise_for_fatal_episode_errors([episode])
+
+
+def test_config_and_validation(tmp_path, monkeypatch):
+    monkeypatch.delenv("VERIFIERS_CONFIG", raising=False)
+    with pytest.raises(ValueError, match="VERIFIERS_CONFIG"):
+        _config_path()
+    path = tmp_path / "remote.toml"
+    path.write_text('[remote]\naddresses=["tcp://cpu:5000"]\n')
+    monkeypatch.setenv("VERIFIERS_CONFIG", str(path))
+    assert _load_config_data(_config_path())["remote"]["addresses"] == ["tcp://cpu:5000"]
+    args = Namespace(
+        rollout_global_dataset=False,
+        partial_rollout=False,
+        chat_template_path=None,
+        use_opd=False,
+        use_output_store=False,
     )
-
-    assert len(group) == 2
-    assert all(isinstance(sample, Sample) for sample in group)
-    args = SimpleNamespace(
-        disable_rollout_trim_samples=True,
-        global_batch_size=1,
-        use_dynamic_global_batch_size=False,
-    )
-    flattened, _ = postprocess_rollout_data(
-        args=args, data=[group], train_parallel_config=make_train_parallel_config(dp_size=1)
-    )
-    assert [sample.routing_key for sample in flattened] == ["first", "second"]
+    _validate_args(args)
+    args.partial_rollout = True
+    with pytest.raises(ValueError, match="partial-rollout"):
+        _validate_args(args)
 
 
-def test_standard_dynamic_filter_accepts_converted_branch_group():
-    from miles.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
-
+def test_checkpoint_resumes_exact_cursor_ids_and_seed(tmp_path):
     adapter = object.__new__(VerifiersRolloutFn)
-    adapter.args = _args()
-    adapter._next_sample_index = 0
-    group = adapter._convert_group(
-        [_trace(id="low", reward=0.0), _trace(id="high", reward=1.0)],
-        group_index=0,
-    )
-
-    assert check_reward_nonzero_std(adapter.args, group).keep
-
-
-@pytest.mark.parametrize(
-    ("overrides", "option"),
-    [
-        (
-            {"eval_interval": None, "n_samples_per_prompt": 1, "n_samples_per_eval_prompt": 1},
-            "--n-samples-per-prompt",
-        ),
-        (
-            {"eval_interval": 1, "n_samples_per_prompt": 2, "n_samples_per_eval_prompt": 1},
-            "--n-samples-per-eval-prompt",
-        ),
-    ],
-)
-def test_group_reward_tasks_require_multiple_rollouts(overrides, option):
-    args = _args(**overrides)
-    tasks = [object()]
-
-    with pytest.raises(ValueError, match=option):
-        _validate_group_reward_sample_counts(args, tasks, lambda _task, _kind: [object()])
-
-
-def test_group_reward_eval_count_is_ignored_when_eval_is_disabled():
-    args = _args(
-        eval_interval=None,
-        n_samples_per_prompt=2,
-        n_samples_per_eval_prompt=1,
-    )
-
-    _validate_group_reward_sample_counts(args, [object()], lambda _task, _kind: [object()])
-
-
-def test_group_reward_train_count_is_ignored_for_eval_only_runs():
-    args = _args(
-        num_rollout=0,
-        eval_interval=1,
-        n_samples_per_prompt=1,
-        n_samples_per_eval_prompt=2,
-    )
-
-    _validate_group_reward_sample_counts(args, [object()], lambda _task, _kind: [object()])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("deterministic", [False, True])
-async def test_verifiers_episode_owns_group_reward_computation(deterministic: bool) -> None:
-    """Episodes own rewards and receive distinct seeds only when deterministic."""
-    pytest.importorskip("verifiers", minversion="0.2.0")
-    pytest.importorskip("renderers", minversion="0.1.8")
-    traces = [_trace(id="a", reward=0.0), _trace(id="b", reward=0.0)]
-    runtime = _import_verifiers()
-    ctx = runtime.ModelContext(client=object(), model="test-model", sampling=runtime.SamplingConfig(sampling_seed=19))
-    rollouts = [SimpleNamespace(ctx=ctx), SimpleNamespace(ctx=ctx)]
-
-    class Episode:
-        def __init__(self) -> None:
-            self.rollouts = rollouts
-
-        async def run(self, semaphore: asyncio.Semaphore) -> list[SimpleNamespace]:
-            assert semaphore is not None
-            traces[0].reward = -1.0
-            traces[1].reward = 1.0
-            return traces
-
-    class Environment:
-        def episode(self, task: str, ctx: Any, n: int) -> Episode:
-            assert task == "task"
-            assert ctx.model == "test-model"
-            assert n == 2
-            return Episode()
-
-    adapter = object.__new__(VerifiersRolloutFn)
-    adapter.args = _args(sglang=SglangConfig(models=[], base_args={"enable_deterministic_inference": deterministic}))
-    adapter.env = Environment()
-    adapter.ctx = ctx
-    adapter.model = "test-model"
-
-    result = await adapter._run_task_group("task", 2, asyncio.Semaphore(2), seed_base=41)
-
-    assert [trace.reward for trace in result] == [-1.0, 1.0]
-    assert [rollout.ctx.sampling.sampling_seed for rollout in rollouts] == ([41, 42] if deterministic else [19, 19])
-    assert ctx.sampling.sampling_seed == 19
-    assert all(rollout.ctx.client is ctx.client and rollout.ctx.model == ctx.model for rollout in rollouts)
-
-
-@pytest.mark.parametrize("min_tokens", [None, 3])
-def test_sampling_config_accepts_runtime_args_without_train_minimum_tokens(min_tokens: int | None) -> None:
-    """Training defaults omit minimum tokens while evaluation preserves its explicit limit."""
-
-    class SamplingConfig:
-        @staticmethod
-        def model_validate(data: dict[str, Any]) -> dict[str, Any]:
-            return data
-
-    args = ImmutableNamespace.model_validate(
-        dict(
-            apply_chat_template_kwargs={},
-            rollout_max_response_len=8,
-            rollout_temperature=0.7,
-            rollout_top_k=20,
-            rollout_top_p=0.9,
-        )
-    )
-    if min_tokens is None:
-        config = VerifiersRolloutFn._sampling_config(SamplingConfig, args, min_tokens=None)
-    else:
-        config = VerifiersRolloutFn._sampling_config(SamplingConfig, args, min_tokens=min_tokens)
-
-    expected = {"temperature": 0.7, "top_p": 0.9, "top_k": 20, "max_tokens": 8}
-    if min_tokens is not None:
-        expected["min_tokens"] = min_tokens
-    assert config == expected
-
-
-def test_eval_args_clear_training_prompt_cap_and_preserve_other_fallbacks():
-    args = _args(
-        eval_max_context_len=128,
-        eval_max_prompt_len=None,
-        eval_max_response_len=None,
-        eval_min_new_tokens=None,
-        eval_reward_key=None,
-        eval_temperature=None,
-        eval_top_k=None,
-        eval_top_p=None,
-        reward_key="score",
-        rollout_max_context_len=64,
-        rollout_max_prompt_len=32,
-        rollout_max_response_len=8,
-    )
-
-    eval_args = _make_eval_args(ImmutableNamespace.model_validate(vars(args)))
-
-    assert eval_args.rollout_max_context_len == 128
-    assert eval_args.rollout_max_prompt_len is None
-    assert eval_args.rollout_max_response_len == 8
-    assert eval_args.reward_key == "score"
-
-
-@pytest.mark.asyncio
-async def test_transport_translates_renderer_request_to_sglang(monkeypatch):
-    requests = []
-
-    async def fake_post(url, payload, headers=None):
-        requests.append((url, payload, headers))
-        return {
-            "request_id": "request-id",
-            "meta_info": {
-                "completion_tokens": 2,
-                "finish_reason": {"type": "stop"},
-                "output_token_logprobs": [[-0.1, 20], [-0.2, 21]],
-            },
-        }
-
-    monkeypatch.setattr("miles.utils.http_utils.post", fake_post)
-    transport = MilesSGLangTransport(_args(sglang_router_policy="manual"))
-
-    response = await transport.post(
-        "http://127.0.0.1:30000/inference/v1/generate",
-        body={
-            "model": "test/model",
-            "token_ids": [10, 11],
-            "sampling_params": {"temperature": 0.2, "max_tokens": 2, "stop_token_ids": [99], "logprobs": 1},
-        },
-        options={"headers": {"X-Session-ID": "trace-id"}},
-    )
-
-    assert response.json()["choices"][0] == {
-        "token_ids": [20, 21],
-        "logprobs": {
-            "content": [
-                {"token": "token_id:20", "logprob": -0.1},
-                {"token": "token_id:21", "logprob": -0.2},
-            ]
-        },
-        "finish_reason": "stop",
-    }
-    assert requests == [
-        (
-            "http://127.0.0.1:30000/generate",
-            {
-                "input_ids": [10, 11],
-                "sampling_params": {
-                    "temperature": 0.2,
-                    "stop_token_ids": [99],
-                    "max_new_tokens": 2,
-                    "skip_special_tokens": True,
-                    "no_stop_trim": True,
-                    "spaces_between_special_tokens": False,
-                    "n": 1,
-                },
-                "return_logprob": True,
-            },
-            {"X-SMG-Routing-Key": "trace-id"},
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_transport_rejects_multimodal_features():
-    transport = MilesSGLangTransport(_args())
-
-    with pytest.raises(NotImplementedError, match="multimodal"):
-        await transport.post(
-            "http://127.0.0.1:30000/inference/v1/generate",
-            body={"token_ids": [1], "sampling_params": {}, "features": {}},
-        )
-
-
-@pytest.mark.asyncio
-async def test_transport_bounds_seen_sessions(monkeypatch):
-    async def fake_post(_url, _payload, headers=None):
-        return {
-            "meta_info": {
-                "completion_tokens": 1,
-                "finish_reason": {"type": "stop"},
-                "output_token_logprobs": [[-0.1, 20]],
-            }
-        }
-
-    monkeypatch.setattr("miles.utils.http_utils.post", fake_post)
-    transport = MilesSGLangTransport(_args())
-    transport._session_cache_size = 2
-    body = {"token_ids": [10], "sampling_params": {}}
-
-    for session_id in ("one", "two", "three"):
-        await transport.post(
-            "http://127.0.0.1:30000/inference/v1/generate",
-            body=body,
-            options={"headers": {"X-Session-ID": session_id}},
-        )
-
-    assert list(transport._seen_sessions) == ["two", "three"]
-
-
-def test_transport_resolves_router_address_lazily():
-    args = _args(sglang_router_ip=None, sglang_router_port=None)
-    transport = MilesSGLangTransport(args)
-
-    args.sglang_router_ip = "10.0.0.4"
-    args.sglang_router_port = 3210
-
-    assert transport.base_url == "http://10.0.0.4:3210/v1"
-
-
-def test_transport_uses_default_model_router():
-    args = _args(
-        sglang_model_routers={
-            "default": ("10.0.0.5", 3211),
-            "ref": ("10.0.0.6", 3212),
-        }
-    )
-
-    assert MilesSGLangTransport(args).base_url == "http://10.0.0.5:3211/v1"
-
-
-def test_eval_transport_keeps_live_router_args():
-    rollout_args = _args(sglang_router_ip=None, sglang_router_port=None)
-    eval_args = _args(sglang_router_ip=None, sglang_router_port=None)
-    transport = MilesSGLangTransport(eval_args, router_args=rollout_args)
-
-    rollout_args.sglang_model_routers = {"default": ("10.0.0.7", 3213)}
-
-    assert transport.base_url == "http://10.0.0.7:3213/v1"
-
-
-@pytest.mark.asyncio
-async def test_eval_rejects_miles_group_reward_model():
-    adapter = object.__new__(VerifiersRolloutFn)
-    adapter.args = _args(group_rm=True)
-
-    with pytest.raises(AssertionError, match="Group RM is not supported for eval rollout"):
-        await adapter._call_eval(SimpleNamespace(rollout_id=0))
-
-
-@pytest.mark.asyncio
-async def test_eval_extracts_structured_miles_reward(monkeypatch):
-    import miles.utils as miles_utils
-
-    @asynccontextmanager
-    async def serving():
-        yield
-
-    async def configure_sglang(_args):
-        return None
-
-    async def run_group(*_args, **_kwargs):
-        return [_trace(rewards={"bonus": 0.25})]
-
-    async def apply_reward(group):
-        group[0].reward = {"score": 0.75, "details": "ok"}
-
-    dumper_utils = SimpleNamespace(configure_sglang=configure_sglang)
-    monkeypatch.setitem(sys.modules, "miles.utils.dumper_utils", dumper_utils)
-    monkeypatch.setattr(miles_utils, "dumper_utils", dumper_utils, raising=False)
-    adapter = object.__new__(VerifiersRolloutFn)
-    adapter.args = _args(
-        custom_rm_path="tests.fake_reward",
-        eval_reward_key="score",
-        group_rm=False,
-        n_samples_per_eval_prompt=1,
-        rm_type=None,
-        rollout_batch_size=1,
-        rollout_seed=1,
-    )
-    adapter.eval_args = _args(reward_key="score")
-    adapter.config = SimpleNamespace(env_id="test-env")
-    adapter.env = SimpleNamespace(serving=serving)
-    adapter.eval_ctx = object()
-    adapter.max_concurrent = 1
-    adapter.model = "test/model"
-    adapter._tasks = [object()]
-    adapter._next_sample_index = 0
-    adapter._run_task_group = run_group
-    adapter._apply_miles_rewards = apply_reward
-
-    output = await adapter._call_eval(SimpleNamespace(rollout_id=0))
-
-    assert output.data["test-env"]["rewards"] == [0.75]
-
-
-class TestRolloutFnContract:
-    def test_it_is_a_rollout_fn_the_loader_accepts(self):
-        """The loader rejects a rollout function that forgets the base, however complete it is."""
-        assert issubclass(VerifiersRolloutFn, BaseRolloutFn)
-
-    def test_the_constructor_input_reaches_the_base(self, monkeypatch):
-        """Skipping super().__init__ leaves constructor_input missing on every path that reads it."""
-
-        class _ImportVerifiersSentinel(Exception):
-            pass
-
-        def raise_sentinel():
-            raise _ImportVerifiersSentinel
-
-        monkeypatch.setattr(verifiers_rollout, "_import_verifiers", raise_sentinel)
-        data_source = object()
-        constructor_input = RolloutFnConstructorInput(args=_args(), data_source=data_source)
-        adapter = object.__new__(VerifiersRolloutFn)
-
-        with pytest.raises(_ImportVerifiersSentinel):
-            VerifiersRolloutFn.__init__(adapter, constructor_input)
-
-        assert adapter.constructor_input.data_source is data_source
-
-
-@pytest.mark.parametrize(
-    "models,expected",
-    [
-        ([("eval", "/eval/tokenizer"), ("default", "/generation/tokenizer")], "/generation/tokenizer"),
-        ([("primary", "/first/tokenizer"), ("eval", "/eval/tokenizer")], "/first/tokenizer"),
-        ([("eval", "/eval/tokenizer"), ("default", None)], "/model/fallback"),
-    ],
-)
-def test_train_client_selects_only_the_generation_models_tokenizer(
-    monkeypatch: pytest.MonkeyPatch, models: list[tuple[str, str | None]], expected: str
-) -> None:
-    """Generation uses its own tokenizer while a conflicting evaluation model remains isolated."""
-
-    class BaseTrainClient:
-        def __init__(self, transport: object, *, pool_size: int, renderer_model_name: str) -> None:
-            self.renderer_model_name = renderer_model_name
-
-    config = SglangConfig(
-        models=[
-            ModelConfig(
-                name=name,
-                model_path=None,
-                update_weights=name != "eval",
-                server_groups=[
-                    ServerGroupConfig(
-                        worker_type="regular",
-                        num_gpus_per_engine=1,
-                        needs_offload=False,
-                        overrides={"tokenizer_path": tokenizer},
-                    )
-                ],
-            )
-            for name, tokenizer in models
-        ],
-        base_args={"tokenizer_path": None},
-    )
-    before = config.model_dump()
-    monkeypatch.setattr(verifiers_rollout, "_renderer_identity", lambda _: None)
-
-    client = _train_client(
-        SimpleNamespace(TrainClient=BaseTrainClient), _args(sglang=config), "/model/fallback", pool_size=1
-    )
-
-    assert client.renderer_model_name == expected
-    assert config.model_dump() == before
+    adapter._active = set()
+    adapter._task_fingerprint = "same data and shuffle"
+    fields = ("_next_train_task_idx", "_next_group_index", "_next_sample_index", "_next_rollout_index", "_next_seed")
+    for index, name in enumerate(fields):
+        setattr(adapter, name, index + 7)
+    adapter.save(tmp_path)
+    for name in fields:
+        setattr(adapter, name, 0)
+    adapter.load(tmp_path)
+    assert [getattr(adapter, name) for name in fields] == list(range(7, 12))
+    adapter._task_fingerprint = "other"
+    with pytest.raises(ValueError, match="different taskset"):
+        adapter.load(tmp_path)

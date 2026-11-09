@@ -15,6 +15,7 @@ setup(
     include_package_data=True,
     package_data={
         "miles.dashboard": ["static/*"],
+        "miles.env_server": ["NOTICE", "LICENSE.prime-rl"],
         "miles.utils.chat_template_utils.templates": ["*.jinja"],
     },
     install_requires=_fetch_requirements("requirements.txt"),
